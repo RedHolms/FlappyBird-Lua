@@ -4,8 +4,8 @@
 script_name("Flappy Bird")
 script_author("HarukiST")
 script_dependencies('mimgui')
-script_version("1.0")
-script_version_number(0x0100)
+script_version("1.1")
+script_version_number(0x0101)
 --                       ^ ^
 --                       ^ Minor
 --                       Major
@@ -39,9 +39,17 @@ PATH_SCORES    = PATH_FLAPPYD .. '/scores.score'
 FRAME_SIZE_X   = 1284
 FRAME_SIZE_Y   = 720
 
+SCREEN_SIZE_X,
+SCREEN_SIZE_Y = getScreenResolution()
+
 -- Should have aspect ratio 17x12
 BIRD_SPRITE_SX = 85
 BIRD_SPRITE_SY = 60
+
+BIRD_COLLIDE_OFFSET_lu = imgui.ImVec2(7 / FRAME_SIZE_X, 7 / FRAME_SIZE_Y) -- NORMALIZED
+BIRD_COLLIDE_OFFSET_rb = imgui.ImVec2(-7 / FRAME_SIZE_X, -7 / FRAME_SIZE_Y) -- NORMALIZED
+BIRD_COLLIDE_OFFSET_ru = imgui.ImVec2(-7 / FRAME_SIZE_X, 7 / FRAME_SIZE_Y) -- NORMALIZED
+BIRD_COLLIDE_OFFSET_lb = imgui.ImVec2(7 / FRAME_SIZE_X, -7 / FRAME_SIZE_Y) -- NORMALIZED
 
 -- Should have aspect ratio 16x128(1x8)
 TUBE_SPRITE_SX = 80
@@ -58,7 +66,7 @@ FRAME_TITLE    = "Flappy Bird"
 
 UNIT_SEPARATOR = string.char(0x1F)
 
-TICKS_PER_SECOND = 40
+TICKS_PER_SECOND = 50
 VELOCITY_BY_INPUT = 3.15 -- Velocity after pressing Space
 TUBES_MOVE_PER_TICK = 0.002 -- NORMALIZED
 VELOCITY_LOST_PER_TICK = 0.07
@@ -73,7 +81,7 @@ POPUP_SIZE_X = 200 -- REAL
 POPUP_SIZE_Y = 120 -- REAL
 MAX_RAND_TUBE_OFFSET_X = 0.08 -- NORMALIZED
 
-TICK_WAIT = 1000 / TICKS_PER_SECOND
+TICK_WAIT = 1--1000 / TICKS_PER_SECOND
 
 VELOCITY_IN_IDLE = -math.sqrt(math.deg(MAX_BIRD_ANGLE) / 6)
 
@@ -82,13 +90,31 @@ TUBES_COUNT = 6
 KEY_FLY = VK_SPACE
 KEY_PAUSE = VK_Q
 
+LOSE_MESSAGES = {
+   'Game over!',
+   'Ты проиграл!',
+   'Гаме овер!',
+   ':(',
+   'Проигрыш!'
+}
+
 --- Global ---
-BG_OFFSET = 0
-TITLE_SIZE = 0
-StyleEditorVisible = false
+function Iter(f, t)
+   local _t = {}
+   for i = 1, t do table.insert(_t, f()) end
+   return _t
+end
 
 new = imgui.new
 ImVec2, ImVec4 = imgui.ImVec2, imgui.ImVec4
+
+BackgroundOffset = 0
+TitlebarSize = 0
+StyleEditorVisible = false
+BirdSpriteCornersPos = Iter(function() return ImVec2(0) end, 4)
+Immune = false
+
+NoCollide = false
 
 --- Score table ---
 -- !!! NOT WORKING NOW !!!
@@ -121,16 +147,17 @@ function ScoreTableDeserialize(s)
 end
 
 --- Game ---
-function Iter(f, t)
-   local _t = {}
-   for i = 1, t do table.insert(_t, f()) end
-   return _t
-end
-
 GAME_STATE_IDLE = 0 -- Before start
 GAME_STATE_PLAY = 1
 GAME_STATE_LOSE = 2
 GAME_STATE_PAUSE = 3
+
+COLLIDE_TOP_SCREEN = 1
+COLLIDE_BOTTOM_SCREEN = 2
+COLLIDE_LU = 3
+COLLIDE_RB = 4
+COLLIDE_RU = 5
+COLLIDE_LB = 6
 
 game = {
    state = GAME_STATE_IDLE,
@@ -138,7 +165,7 @@ game = {
    pPosY = 0.5, -- NORMALIZED. 1 - top, 0 - bottom
    tubes_holes = Iter(function() return ImVec2(-100, 0.5) end, TUBES_COUNT),
    pVelocity = 0, -- pVelocity > 0 - Up; pVelocity < 0 - Down; pVelocity == 0 - Stay;
-   th_GameUpdater = nil -- Handler of Game Cycle thread
+   threadWork = false,
 }
 function game:WaitForNextClock()
    local t = os.clock()
@@ -147,15 +174,20 @@ end
 function game:Reset()
    self.pPosY = 0.5
    self.pVelocity = 0
+   self.score = 0
+   self.threadWork = false
    self.tubes_holes = Iter(function() return ImVec2(-100, 0.5) end, TUBES_COUNT)
    game:RandomTubes()
 end
-function game:Run() self.th_GameUpdater:run(self) end
+function game:Run()
+   Immune = true
+   game.state = GAME_STATE_PLAY
+   self.threadWork = true
+end
 function game:Tick()
-   BG_OFFSET = BG_OFFSET - TUBES_MOVE_PER_TICK
-   if BG_OFFSET <= -1 then BG_OFFSET = 0 end
-
    if self.state == GAME_STATE_PAUSE or self.state == GAME_STATE_LOSE then return self.state == GAME_STATE_LOSE end
+   BackgroundOffset = BackgroundOffset - TUBES_MOVE_PER_TICK
+   if BackgroundOffset <= -1 then BackgroundOffset = 0 end
    if self.state == GAME_STATE_IDLE then
       self.pPosY = 0.5
       self.pVelocity = VELOCITY_IN_IDLE
@@ -184,30 +216,45 @@ function game:Tick()
    local col, whatCol
    col, whatCol = self:CheckBirdCollision() 
    if col then
-      if DEBUG then
-         print(string.format('COLLIDE %d', whatCol))
-      end
+      if Immune then Immune = false return end
+      RandomLoseMessage()
       self.state = GAME_STATE_LOSE
+      DebugPrint(string.format('COLLIDE %d', whatCol))
    end
 end
 
 function game:CheckBirdCollision()
-   local birdLeftUpper, birdRigthBottom = self:GetBirdColliderN()
+   if NoCollide then return false end
+   local blu, brb, bru, blb = self:GetBirdColliderN()
    
-   if birdLeftUpper.y < NormY(TITLE_SIZE) then return true, 1 end -- If collide with uppper-border
-   if birdRigthBottom.y > 1 then return true, 2 end -- If collide with botton-border
+   if blu.y < NormY(TitlebarSize) then return true, COLLIDE_TOP_SCREEN end -- If collide with uppper-border
+   if brb.y > 1 then return true, COLLIDE_BOTTOM_SCREEN end -- If collide with botton-border
 
    for _, hole_pos in pairs(self.tubes_holes) do
-      local holeLeftUpper, holeRigthBottom = self:GetTubeNonCollideZoneN(hole_pos)
+      local holeLeftUpper, holeRightBottom = self:GetTubeNonCollideZoneN(hole_pos)
 
-      -- If no collide with tube by X-axis
-      if birdRigthBottom.x < holeLeftUpper.x then goto continue end
-      if birdLeftUpper.x > holeRigthBottom.x then goto continue end
+      -- If no collide
+      if blu.x > holeRightBottom.x and
+         brb.x < holeLeftUpper.x and
+         bru.x < holeLeftUpper.x and
+         blb.x > holeRightBottom.x then 
+            goto continue 
+      end
 
-      -- Check collide with tube
-      if birdLeftUpper.y < holeLeftUpper.y then return true, 3 end
-      if birdRigthBottom.y > holeRigthBottom.y then return true, 4 end
+      if (blu.x > holeRightBottom.x or blu.x < holeLeftUpper.x) then goto chk_brb end
+      if (blu.y > holeRightBottom.y or blu.y < holeLeftUpper.y) then return true, COLLIDE_LU end
 
+      ::chk_brb::
+      if (brb.x > holeRightBottom.x or brb.x < holeLeftUpper.x) then goto chk_bru end
+      if (brb.y > holeRightBottom.y or brb.y < holeLeftUpper.y) then return true, COLLIDE_RB end
+
+      ::chk_bru::
+      if (bru.x > holeRightBottom.x or bru.x < holeLeftUpper.x) then goto chk_blb end
+      if (bru.y > holeRightBottom.y or bru.y < holeLeftUpper.y) then return true, COLLIDE_RU end
+
+      ::chk_blb::
+      if (blb.x > holeRightBottom.x or blb.x < holeLeftUpper.x) then goto continue end
+      if (blb.y > holeRightBottom.y or blb.y < holeLeftUpper.y) then return true, COLLIDE_LB end
    ::continue:: end
 
    return false
@@ -264,16 +311,22 @@ function game:GetFarestTube()
    return farestTubeI
 end
 
+-- GetBirdCollider[R/N] Returns:
+-- lu, rb, ru, lb, nil
 function game:GetBirdColliderR()
    return
-      ImVec2(RealX(BIRD_POS_X) - BIRD_SPRITE_SX, RealY(self.pPosY) - BIRD_SPRITE_SY),  -- Left-Upper
-      Real(ImVec2(BIRD_POS_X, self.pPosY)),                                            -- Right-Bottom
+      Real(BirdSpriteCornersPos[1] + BIRD_COLLIDE_OFFSET_lu),
+      Real(BirdSpriteCornersPos[3] + BIRD_COLLIDE_OFFSET_rb),
+      Real(BirdSpriteCornersPos[2] + BIRD_COLLIDE_OFFSET_ru),
+      Real(BirdSpriteCornersPos[4] + BIRD_COLLIDE_OFFSET_lb),
       nil
 end
 function game:GetBirdColliderN()
    return
-      ImVec2(BIRD_POS_X - NormX(BIRD_SPRITE_SX), self.pPosY - NormY(BIRD_SPRITE_SY)),  -- Left-Upper
-      ImVec2(BIRD_POS_X, self.pPosY),                                                  -- Right-Bottom
+      BirdSpriteCornersPos[1] + BIRD_COLLIDE_OFFSET_lu,
+      BirdSpriteCornersPos[3] + BIRD_COLLIDE_OFFSET_rb,
+      BirdSpriteCornersPos[2] + BIRD_COLLIDE_OFFSET_ru,
+      BirdSpriteCornersPos[4] + BIRD_COLLIDE_OFFSET_lb,
       nil
 end
 
@@ -307,6 +360,9 @@ function game:OnKeyPress(key)
             thole = thole - ImVec2(TUBES_MOVE_PER_TICK*20, 0)
             self.tubes_holes[k] = thole
          end
+      elseif key == VK_C then
+         NoCollide = not NoCollide
+         sampAddChatMessage(tostring(NoCollide), -1)
       end
    end
    if key == KEY_FLY then
@@ -323,23 +379,27 @@ function game:OnKeyPress(key)
 end
 function game:SuspendForTime(t)
    local st = os.clock() * 1000
-   while st - ((os.clock() * 1000) - t) > 0 do wait(0) end
+   while st - ((os.clock() * 1000) - t) > 0 do wait(1) end
 end
-
-game.th_GameUpdater = lua_thread.create_suspended(function(self)
-   while true do self:SuspendForTime(TICK_WAIT)
-      if self:Tick() then
-         print("Game was ended")
-         return
-      end
-   end
-end)
 
 --- Callbacks ---
 function onWindowMessage(msg, wparam, lparam)
    if msg == WM_KEYDOWN or msh == WM_SYSKEYDOWN then
+      if sampIsChatInputActive() or sampIsDialogActive() or sampIsScoreboardOpen() then return end
       game:OnKeyPress(wparam)
    end
+end
+
+-- Functions --
+do
+local _randlosemsg = ''
+function GetRandomLoseMessage()
+   return _randlosemsg
+end
+function RandomLoseMessage()
+   math.randomseed(os.clock())
+   _randlosemsg = LOSE_MESSAGES[math.random(1, #LOSE_MESSAGES)]
+end
 end
 
 --- Main ---
@@ -354,15 +414,23 @@ function main()
       if arg:match('BIRD_ROTATE=%d+') and DEBUG then BIRD_ROTATE = arg:match('BIRD_ROTATE=(%d+)') return end
       if arg == 'RUN' and DEBUG then 
          game:Reset()
-         game.state = GAME_STATE_PLAY
+         game:Run()
          return
       end
       f_MainFrame.enabled[0] = not f_MainFrame.enabled[0]
    end)
 
-   game:Run()
+   game.threadWork = true
 
-   wait(-1)
+   ::start_cycle::
+   while true do game:SuspendForTime(TICK_WAIT)
+      if not game.threadWork then goto continue end
+      if game:Tick() then
+         --print("Game was ended")
+         break
+      end
+   ::continue:: end
+   goto start_cycle
 end
 
 --- Utils ---
@@ -417,10 +485,10 @@ function imgui.ImageRotated(tex_id, center, size, angle)
    local cos_a = math.cos(angle)
    local sin_a = math.sin(angle)
    local pos = {
-      center + imgui.ImRotate(ImVec2(-size.x * 0.5, -size.y * 0.5), cos_a, sin_a),
-      center + imgui.ImRotate(ImVec2(size.x * 0.5, -size.y * 0.5), cos_a, sin_a),
-      center + imgui.ImRotate(ImVec2(size.x * 0.5, size.y * 0.5), cos_a, sin_a),
-      center + imgui.ImRotate(ImVec2(-size.x * 0.5, size.y * 0.5), cos_a, sin_a)
+      center + imgui.ImRotate(ImVec2(-size.x * 0.5, -size.y * 0.5), cos_a, sin_a), -- Left-Upper
+      center + imgui.ImRotate(ImVec2(size.x * 0.5, -size.y * 0.5), cos_a, sin_a), -- Right-Upper
+      center + imgui.ImRotate(ImVec2(size.x * 0.5, size.y * 0.5), cos_a, sin_a), -- Right-Bottom
+      center + imgui.ImRotate(ImVec2(-size.x * 0.5, size.y * 0.5), cos_a, sin_a) -- Left-Bottom
    }
    local uvs = { 
       ImVec2(0.0, 0.0), 
@@ -430,6 +498,10 @@ function imgui.ImageRotated(tex_id, center, size, angle)
    }
 
    draw_list.AddImageQuad(draw_list, tex_id, pos[1], pos[2], pos[3], pos[4], uvs[1], uvs[2], uvs[3], uvs[4], -1)
+   BirdSpriteCornersPos[1] = Norm(pos[1] - imgui.GetWindowPos())
+   BirdSpriteCornersPos[2] = Norm(pos[2] - imgui.GetWindowPos())
+   BirdSpriteCornersPos[3] = Norm(pos[3] - imgui.GetWindowPos())
+   BirdSpriteCornersPos[4] = Norm(pos[4] - imgui.GetWindowPos())
 end
 function imgui.CenterText(center_y, fmt, ...)
    local text = fmt:format(...)
@@ -457,29 +529,32 @@ f_MainFrame.frame = imgui.OnFrame(
          imgui.ShowStyleEditor()
       end
 
-      TITLE_SIZE = imgui.CalcTextSize(FRAME_TITLE).y + (style.FramePadding.y * 2) + 1
+      TitlebarSize = imgui.CalcTextSize(FRAME_TITLE).y + (style.FramePadding.y * 2) + 1
 
       imgui.SetNextWindowSize(imgui.ImVec2(FRAME_SIZE_X, FRAME_SIZE_Y), imgui.Cond.Always)
-      imgui.SetNextWindowPos(imgui.ImVec2(100, 100), imgui.Cond.Once)
+      imgui.SetNextWindowPos(imgui.ImVec2((SCREEN_SIZE_X / 2) - (FRAME_SIZE_X / 2), (SCREEN_SIZE_Y / 2) - (FRAME_SIZE_Y / 2)), imgui.Cond.Once)
       imgui.Begin(FRAME_TITLE, f_MainFrame.enabled, imgui.WindowFlags.NoResize + imgui.WindowFlags.NoScrollWithMouse + imgui.WindowFlags.NoScrollbar)
 
          -- Background
-         imgui.SetCursorPos(ImVec2(0 + (BG_SPRITE_SX * BG_OFFSET), 0))
+         imgui.SetCursorPos(ImVec2(0 + (BG_SPRITE_SX * BackgroundOffset), 0))
          imgui.Image(image.bgFrame, ImVec2(BG_SPRITE_SX, BG_SPRITE_SY))
-         imgui.SetCursorPos(ImVec2(BG_SPRITE_SX + (BG_SPRITE_SX * BG_OFFSET), 0))
+         imgui.SetCursorPos(ImVec2(BG_SPRITE_SX + (BG_SPRITE_SX * BackgroundOffset), 0))
          imgui.Image(image.bgFrame, ImVec2(BG_SPRITE_SX, BG_SPRITE_SY))
-         imgui.SetCursorPos(ImVec2(2*BG_SPRITE_SX + (BG_SPRITE_SX * BG_OFFSET), 0))
+         imgui.SetCursorPos(ImVec2((2 * BG_SPRITE_SX) + (BG_SPRITE_SX * BackgroundOffset), 0))
          imgui.Image(image.bgFrame, ImVec2(BG_SPRITE_SX, BG_SPRITE_SY))
 
          if DEBUG then
             -- Draw Bird collider
-            local lu, rb = game:GetBirdColliderR()
-            imgui.GetWindowDrawList():AddRect(imgui.GetWindowPos() + lu, imgui.GetWindowPos() + rb, imgui.GetColorU32Vec4(ImVec4(0,1,0,1)))
-            imgui.GetWindowDrawList():AddLine(imgui.GetWindowPos() + lu, imgui.GetWindowPos() + lu+ImVec2(0, -50), imgui.GetColorU32Vec4(ImVec4(1,1,0,1)))
+            local lu, rb, ru, lb = game:GetBirdColliderR()
+            local dl = imgui.GetWindowDrawList()
+            dl:AddLine(imgui.GetWindowPos() + lu, imgui.GetWindowPos() + ru, imgui.GetColorU32Vec4(ImVec4(0,1,0,1)))
+            dl:AddLine(imgui.GetWindowPos() + ru, imgui.GetWindowPos() + rb, imgui.GetColorU32Vec4(ImVec4(0,1,0,1)))
+            dl:AddLine(imgui.GetWindowPos() + rb, imgui.GetWindowPos() + lb, imgui.GetColorU32Vec4(ImVec4(0,1,0,1)))
+            dl:AddLine(imgui.GetWindowPos() + lb, imgui.GetWindowPos() + lu, imgui.GetColorU32Vec4(ImVec4(0,1,0,1)))
          end
 
          -- Bird
-         imgui.SetCursorPos(ImVec2(RealX(BIRD_POS_X), RealY(game.pPosY) - BIRD_SPRITE_SY + TITLE_SIZE))
+         imgui.SetCursorPos(ImVec2(RealX(BIRD_POS_X), RealY(game.pPosY) - BIRD_SPRITE_SY + TitlebarSize))
          imgui.ImageRotated(image.bird, 
             ImVec2(
                imgui.GetWindowPos().x + RealX(BIRD_POS_X) - (BIRD_SPRITE_SX / 2),
@@ -512,7 +587,7 @@ f_MainFrame.frame = imgui.OnFrame(
          end
 
          if game.state == GAME_STATE_PLAY then
-            imgui.SetCursorPos(ImVec2(10, 5 + TITLE_SIZE))
+            imgui.SetCursorPos(ImVec2(10, 5 + TitlebarSize))
             imgui.Text(('Набрано %d очков'):format(game.score))
          elseif game.state == GAME_STATE_IDLE then
             imgui.SetCursorPos(ImVec2(imgui.GetWindowSize().x / 2, imgui.GetWindowSize().y / 2) - ImVec2(POPUP_SIZE_X / 2, POPUP_SIZE_Y / 2))
@@ -528,7 +603,7 @@ f_MainFrame.frame = imgui.OnFrame(
                imgui.Button("Играть!", ImVec2(180, 25))
                then
                   game:Reset()
-                  game.state = GAME_STATE_PLAY
+                  game:Run()
                end
             imgui.EndChild()
             imgui.PopStyleColor()
@@ -541,7 +616,7 @@ f_MainFrame.frame = imgui.OnFrame(
             imgui.BeginChild('fade', imgui.GetWindowSize()) imgui.EndChild()
             imgui.PopStyleColor()
 
-            -- Show window about lose
+            -- Show window about pause
             imgui.SetCursorPos(ImVec2(imgui.GetWindowSize().x / 2, imgui.GetWindowSize().y / 2) - ImVec2(POPUP_SIZE_X / 2, POPUP_SIZE_Y / 2))
             imgui.PushStyleColor(imgui.Col.ChildBg, style.Colors[imgui.Col.WindowBg])
             imgui.BeginChild('pausewin', ImVec2(POPUP_SIZE_X, POPUP_SIZE_Y), true)
@@ -573,7 +648,7 @@ f_MainFrame.frame = imgui.OnFrame(
             imgui.BeginChild('losewin', ImVec2(POPUP_SIZE_X, POPUP_SIZE_Y), true)
                imgui.SetCursorPosY(20)
                imgui.PushFont(font[24])
-                  imgui.CenterText(false, "Ты проиграл!")
+                  imgui.CenterText(false, GetRandomLoseMessage())
                imgui.PopFont()
                imgui.CenterText(false, "Ты набрал %d очков", game.score)
                imgui.SetCursorPosY(imgui.GetWindowHeight() - 45)
@@ -582,7 +657,6 @@ f_MainFrame.frame = imgui.OnFrame(
                imgui.Button("Играть снова", ImVec2(180, 25))
                then
                   game:Reset()
-                  game.state = GAME_STATE_PLAY
                   game:Run()
                end
             imgui.EndChild()
